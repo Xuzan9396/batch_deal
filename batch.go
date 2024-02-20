@@ -11,13 +11,15 @@ type BatchDeal struct {
 	autoCommitChan chan IBaseBatch
 	limit          int
 	newBatch       func() IBaseBatch
-	//once           sync.Once
+	isDone         bool
 }
 
 func InitBatch(maxBatchSize, autoCommitChanSize, limit int, newBatch func() IBaseBatch) *BatchDeal {
 
 	batchModel := &BatchDeal{
-		batchChan:      make(chan interface{}, maxBatchSize),
+		// 写入channel 长度
+		batchChan: make(chan interface{}, maxBatchSize),
+		// 自动提交长度
 		autoCommitChan: make(chan IBaseBatch, autoCommitChanSize),
 		limit:          limit,
 		newBatch:       newBatch,
@@ -27,8 +29,14 @@ func InitBatch(maxBatchSize, autoCommitChanSize, limit int, newBatch func() IBas
 	return batchModel
 }
 
+// 写入数据
 func (c *BatchDeal) SendBatch(par interface{}) {
 	c.appendJobLog(par)
+}
+
+// 判断数据是否跑完
+func (c *BatchDeal) IsDone() bool {
+	return c.isDone && len(c.batchChan) == 0 && len(c.autoCommitChan) == 0
 }
 
 type BaseBatch struct {
@@ -57,11 +65,13 @@ func (c *BatchDeal) writeLoop() {
 		batchInfo   IBaseBatch
 		commitTimer *time.Timer
 	)
-
+	// 默认是没数据的
+	c.isDone = true
 	for {
 		select {
 		case batchPar = <-c.batchChan:
 			if batchInfo == nil {
+				c.isDone = false
 				batchInfo = c.newBatch()
 
 				commitTimer = time.AfterFunc(1*time.Second, func(batchInfo IBaseBatch) func() {
@@ -76,6 +86,7 @@ func (c *BatchDeal) writeLoop() {
 			if len(batchInfo.Lists()) >= c.limit {
 				commitTimer.Stop()
 				batchInfo.Callback("正常")
+				c.isDone = true
 				batchInfo = nil
 			}
 		case timeOutBatch := <-c.autoCommitChan:
@@ -84,6 +95,7 @@ func (c *BatchDeal) writeLoop() {
 				continue
 			}
 			timeOutBatch.Callback("超时")
+			c.isDone = true
 			batchInfo = nil
 		}
 	}
