@@ -33,11 +33,10 @@ func newMyBatch(results chan<- int) IBaseBatch {
 }
 
 func TestSendBatch(t *testing.T) {
-	rand.Seed(time.Now().UnixNano()) // 确保每次运行程序时，都会得到不同的随机数
 	results := make(chan int)
 	num := 20
 	go func() {
-		model := InitBatch(100, 100, 5, func() IBaseBatch { return newMyBatch(results) })
+		model := InitBatch(100, 100, func() IBaseBatch { return newMyBatch(results) })
 		for i := 1; i <= num; i++ {
 			is := i
 			min := 100

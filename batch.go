@@ -3,6 +3,7 @@ package batch_deal
 import (
 	"errors"
 	"log"
+	"sync"
 	"time"
 )
 
@@ -11,18 +12,24 @@ type BatchDeal struct {
 	autoCommitChan chan IBaseBatch
 	limit          int
 	newBatch       func() IBaseBatch
-	isDone         bool
+	closed         bool  // 表示退出完成的通道 true 退出完成
+	stopped        int32 // 原子标志，用于指示是否停止写入
+	closeOnce      sync.Once
+	lock           sync.RWMutex // 新增互斥锁
 }
 
-func InitBatch(maxBatchSize, autoCommitChanSize, limit int, newBatch func() IBaseBatch) *BatchDeal {
+// maxBatchSize 缓冲区大小
+// limit 自动提交大小
+func InitBatch(maxBatchSize, limit int, newBatch func() IBaseBatch) *BatchDeal {
 
 	batchModel := &BatchDeal{
 		// 写入channel 长度
 		batchChan: make(chan interface{}, maxBatchSize),
-		// 自动提交长度
-		autoCommitChan: make(chan IBaseBatch, autoCommitChanSize),
-		limit:          limit,
-		newBatch:       newBatch,
+		// 自动提交批次长度
+		autoCommitChan: make(chan IBaseBatch, 8),
+		// 每个批次大小
+		limit:    limit,
+		newBatch: newBatch,
 	}
 
 	go batchModel.writeLoop()
@@ -30,34 +37,39 @@ func InitBatch(maxBatchSize, autoCommitChanSize, limit int, newBatch func() IBas
 }
 
 // 写入数据
-func (c *BatchDeal) SendBatch(par interface{}) {
+func (c *BatchDeal) SendBatch(par interface{}) bool {
+	// 检查是否停止写入
+	c.lock.RLock()
+	if c.stopped == 1 {
+		c.lock.RUnlock()
+		return false // 如果已经停止，则直接返回，不再写入
+	}
+	// 包含在锁的缘故， 如果刚好有个数据到里了，然后 close 了，这个appendJobLog 一个close 发生panic
 	c.appendJobLog(par)
+	c.lock.RUnlock()
+	return true
 }
 
-// 判断数据是否跑完
-func (c *BatchDeal) IsDone() bool {
-	return c.isDone && len(c.batchChan) == 0 && len(c.autoCommitChan) == 0
-}
+// 优雅触发退出流程，并提供轮询退出状态的功能，true 已经退出了，false 还在退出中
+func (c *BatchDeal) DrainClose() bool {
+	c.closeOnce.Do(func() {
+		c.lock.Lock()
+		c.stopped = 1      // 设置停止标志
+		close(c.batchChan) // 关闭写入通道
+		c.lock.Unlock()
+	})
+	return c.closed // 等待所有处理完成 true
 
-type BaseBatch struct {
-	List []interface{}
 }
-
-func (b *BaseBatch) Append(par interface{}) {
-	b.List = append(b.List, par)
-}
-
-func (b *BaseBatch) Lists() []interface{} {
-	return b.List
-}
-
-func (b *BaseBatch) Callback(par interface{}) {}
 
 func (c *BatchDeal) writeLoop() {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Println(errors.New("灾难错误"), r)
 		}
+		close(c.autoCommitChan) // 完成所有操作后关闭自动提交通道
+		//close(c.closed)         // 通知退出完成
+		c.closed = true
 	}()
 
 	var (
@@ -66,27 +78,36 @@ func (c *BatchDeal) writeLoop() {
 		commitTimer *time.Timer
 	)
 	// 默认是没数据的
-	c.isDone = true
+	var wg sync.WaitGroup
+loop:
 	for {
 		select {
-		case batchPar = <-c.batchChan:
+		case batchParTmp, ok := <-c.batchChan:
+			if !ok {
+				// 退出了
+				break loop
+			}
+			batchPar = batchParTmp
 			if batchInfo == nil {
-				c.isDone = false
 				batchInfo = c.newBatch()
-
+				wg.Add(1) // 增加等待组计数
 				commitTimer = time.AfterFunc(1*time.Second, func(batchInfo IBaseBatch) func() {
 					return func() {
+						defer wg.Done()
+						// 如果没有关闭
 						c.autoCommitChan <- batchInfo
 					}
 				}(batchInfo),
 				)
+
 			}
 
 			batchInfo.Append(batchPar)
 			if len(batchInfo.Lists()) >= c.limit {
-				commitTimer.Stop()
+				if commitTimer.Stop() {
+					wg.Done()
+				}
 				batchInfo.Callback("正常")
-				c.isDone = true
 				batchInfo = nil
 			}
 		case timeOutBatch := <-c.autoCommitChan:
@@ -95,21 +116,31 @@ func (c *BatchDeal) writeLoop() {
 				continue
 			}
 			timeOutBatch.Callback("超时")
-			c.isDone = true
 			batchInfo = nil
+
 		}
 	}
+
+	wg.Wait()
+	for {
+		select {
+		case timeOutBatch := <-c.autoCommitChan:
+			if timeOutBatch != batchInfo {
+				continue
+			}
+			timeOutBatch.Callback("超时")
+			batchInfo = nil
+		default:
+			//log.Println("完全退出")
+			return
+
+		}
+	}
+
 }
 
 func (c *BatchDeal) appendJobLog(batchPar interface{}) {
 	select {
 	case c.batchChan <- batchPar:
-		//default:
 	}
-}
-
-type IBaseBatch interface {
-	Append(interface{})
-	Lists() []interface{}
-	Callback(par interface{})
 }
